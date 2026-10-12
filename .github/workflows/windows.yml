@@ -1,0 +1,127 @@
+name: windows
+
+# Builds retry for Windows against the MSYS2 runtime and publishes it as a
+# release, for the `retry` manifest in regulad/scoop-regulad. Built from
+# upstream's release tarball with retry.c unmodified; windows/win32-compat.c
+# is linked in beside it (windows/README.md says what it changes and why).
+#
+# Run by hand per upstream release: the tag is retry-<version>-windows, which
+# is what the scoop manifest's checkver and autoupdate look for.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream release to build (minfrin/retry tag retry-<version>)"
+        required: true
+        default: "1.0.6"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2025
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2.33.0
+        with:
+          msystem: MSYS
+          update: true
+          install: gcc make autoconf automake libtool
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "retry-$VERSION.tar.gz" \
+            "https://github.com/minfrin/retry/releases/download/retry-$VERSION/retry-$VERSION.tar.gz"
+          tar -xzf "retry-$VERSION.tar.gz"
+          cd "retry-$VERSION"
+          ./configure --prefix=/usr
+          gcc -O2 -Wall -Werror -c -o win32-compat.o ../windows/win32-compat.c
+          make LDFLAGS="-Wl,--wrap=execvp" LIBS="$PWD/win32-compat.o"
+          make install DESTDIR="$PWD/stage"
+          # The wrap is the whole point of the build; fail if it did not land.
+          nm stage/usr/bin/retry.exe | grep -q __wrap_execvp
+
+          mkdir -p ../dist
+          cp stage/usr/bin/retry.exe ../dist/
+          strip ../dist/retry.exe
+          cp /usr/bin/msys-2.0.dll ../dist/
+          cp COPYING ../dist/COPYING
+          cp ../windows/README.md ../dist/README.md
+          runtime="$(pacman -Q msys2-runtime | cut -d' ' -f2)"
+          cat > ../dist/SOURCES.txt <<EOF
+          retry $VERSION for Windows
+
+          retry.exe
+            upstream: https://github.com/minfrin/retry/releases/tag/retry-$VERSION
+            built by: https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_SHA
+                      (windows/win32-compat.c, .github/workflows/windows.yml)
+            license:  Apache-2.0 (COPYING)
+
+          msys-2.0.dll
+            package:  msys2-runtime $runtime
+            source:   https://repo.msys2.org/msys/sources/msys2-runtime-$runtime.src.tar.zst
+            license:  GPL-3.0-or-later with the Cygwin linking exception
+          EOF
+
+      - name: Smoke test from native shells
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $retry = Join-Path $PWD 'dist\retry.exe'
+          function Assert($Name, $Ok) { if (-not $Ok) { throw "smoke test failed: $Name" }; Write-Host "ok: $Name" }
+
+          # Arguments reach a native program verbatim (no MSYS2 path conversion).
+          $out = & $retry -t 1 -- cmd /c echo ok /x a/b
+          Assert 'native argv' ($LASTEXITCODE -eq 0 -and $out -eq 'ok /x a/b')
+
+          # The last delay repeats; the final status is the command's own.
+          & $retry -t 3 -d 1 -- cmd /c exit 7
+          Assert 'exit status' ($LASTEXITCODE -eq 7)
+
+          # A bare name resolves a .cmd on PATH, as cmd.exe would.
+          $bin = Join-Path $env:RUNNER_TEMP 'retry-smoke'
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          Set-Content -LiteralPath (Join-Path $bin 'hello-retry.cmd') -Value '@echo hello %*' -Encoding ascii
+          $env:PATH = "$bin;$env:PATH"
+          $out = & $retry -t 1 -- hello-retry world
+          Assert 'bare .cmd name' ($LASTEXITCODE -eq 0 -and $out -eq 'hello world')
+
+          # stdin is captured and replayed to the command.
+          $out = 'piped line' | & $retry -t 1 -- findstr piped
+          Assert 'stdin replay' ($LASTEXITCODE -eq 0 -and $out -eq 'piped line')
+
+          # A flaky command succeeds on its second try.
+          $flag = Join-Path $bin 'flaky.txt'
+          & $retry -t 3 -d 1 -- pwsh -NoProfile -Command "Add-Content '$flag' x; if (@(Get-Content '$flag').Count -ge 2) { exit 0 } else { exit 1 }"
+          Assert 'retries until success' ($LASTEXITCODE -eq 0)
+
+          # cmd.exe sees the exit status too.
+          cmd /d /v:on /c "`"$retry`" -t 1 -- cmd /c exit 3 & exit !errorlevel!"
+          Assert 'cmd.exe errorlevel' ($LASTEXITCODE -eq 3)
+
+      - name: Package and release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "retry-$env:VERSION-windows"
+          $zip = "retry-$env:VERSION-windows-x86_64.zip"
+          Compress-Archive -Path dist\* -DestinationPath $zip
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
+          Set-Content -LiteralPath "$zip.sha256" -Value "$hash  $zip" -Encoding ascii -NoNewline
+          Write-Host "sha256: $hash"
+          gh release create $tag $zip "$zip.sha256" `
+            --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA `
+            --title "retry $env:VERSION for Windows" `
+            --notes "minfrin/retry $env:VERSION built against the MSYS2 runtime, x86_64 (runs under emulation on Windows on Arm). See windows/README.md and SOURCES.txt in the zip."
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
