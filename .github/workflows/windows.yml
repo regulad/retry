@@ -108,6 +108,10 @@ jobs:
           cmd /d /v:on /c "`"$retry`" -t 1 -- cmd /c exit 3 & exit !errorlevel!"
           Assert 'cmd.exe errorlevel' ($LASTEXITCODE -eq 3)
 
+          # The runner ends a pwsh step with `exit $LASTEXITCODE`, which is
+          # still the 3 asserted on above.
+          exit 0
+
       - name: Package and release
         shell: pwsh
         env:
